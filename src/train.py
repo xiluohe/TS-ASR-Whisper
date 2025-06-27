@@ -6,7 +6,7 @@ from safetensors.torch import load_file
 from transformers import EarlyStoppingCallback
 from transformers.utils import logging
 
-from data.local_datasets import build_dataset, TS_ASR_Dataset, TS_ASR_Random_Dataset, DataCollator, get_text_norm
+from data.local_datasets import build_dataset, TS_ASR_Dataset, TS_ASR_Random_Dataset, DataCollator, get_text_norm, TS_ASR_HEAT_Dataset
 from models.containers import WhisperQKContainer, WhisperContainer, get_optimizer
 from mt_asr.dataset import MT_ASR_Dataset, MT_Data_Collator
 from utils.evaluation import compute_longform_metrics
@@ -27,22 +27,55 @@ def main(cfg: Cfg) -> None:
 
     # 2. Create dataset instances
     text_norm = get_text_norm(data_args.eval_text_norm)
-    train_dataset_class = TS_ASR_Random_Dataset if data_args.use_random_segmentation else TS_ASR_Dataset
-    train_dataset = train_dataset_class(train_cutsets, do_augment=data_args.do_augment,
-                                        dataset_weights=data_args.dataset_weights,
-                                        use_timestamps=data_args.use_timestamps,
-                                        musan_noises=data_args.musan_noises,
-                                        text_norm=get_text_norm(data_args.train_text_norm),
-                                        empty_transcript_ratio=data_args.empty_transcripts_ratio,
-                                        train_with_diar_outputs=data_args.train_with_diar_outputs,
-                                        audio_path_prefix=data_args.audio_path_prefix,
-                                        audio_path_prefix_replacement=data_args.audio_path_prefix_replacement,
-                                        vad_from_alignments=data_args.vad_from_alignments,
-                                        random_sentence_l_crop_p=data_args.random_sentence_l_crop_p,
-                                        random_sentence_r_crop_p=data_args.random_sentence_r_crop_p,
-                                        max_l_crop=data_args.max_l_crop,
-                                        max_r_crop=data_args.max_r_crop,
-                                        )
+
+    if data_args.use_random_segmentation and data_args.use_heat_diar:
+        logger.info("Cannot have both use_random_segmentation and use_heat_diar right now.")
+        train_dataset_class = None
+    if data_args.use_random_segmentation:
+        logger.info("Using TS_ASR_Random_Dataset")
+        train_dataset_class = TS_ASR_Random_Dataset
+    elif data_args.use_heat_diar:
+        logger.info("Using TS_ASR_HEAT_Dataset")
+        train_dataset_class = TS_ASR_HEAT_Dataset
+    else:
+        logger.info("Using TS_ASR_Dataset")
+        train_dataset_class = TS_ASR_Dataset
+    # train_dataset_class = TS_ASR_Random_Dataset if data_args.use_random_segmentation else TS_ASR_Dataset
+
+    if data_args.use_heat_diar:
+        train_dataset = train_dataset_class(train_cutsets, do_augment=data_args.do_augment,
+                                            dataset_weights=data_args.dataset_weights,
+                                            use_timestamps=data_args.use_timestamps,
+                                            musan_noises=data_args.musan_noises,
+                                            text_norm=get_text_norm(data_args.train_text_norm),
+                                            empty_transcript_ratio=data_args.empty_transcripts_ratio,
+                                            train_with_diar_outputs=data_args.train_with_diar_outputs,
+                                            audio_path_prefix=data_args.audio_path_prefix,
+                                            audio_path_prefix_replacement=data_args.audio_path_prefix_replacement,
+                                            vad_from_alignments=data_args.vad_from_alignments,
+                                            random_sentence_l_crop_p=data_args.random_sentence_l_crop_p,
+                                            random_sentence_r_crop_p=data_args.random_sentence_r_crop_p,
+                                            max_l_crop=data_args.max_l_crop,
+                                            max_r_crop=data_args.max_r_crop,
+                                            num_heat_channels=data_args.num_heat_channels,
+                                            oracle_heat_assignment_method=data_args.oracle_heat_assignment_method,
+                                            )
+    else:
+        train_dataset = train_dataset_class(train_cutsets, do_augment=data_args.do_augment,
+                                            dataset_weights=data_args.dataset_weights,
+                                            use_timestamps=data_args.use_timestamps,
+                                            musan_noises=data_args.musan_noises,
+                                            text_norm=get_text_norm(data_args.train_text_norm),
+                                            empty_transcript_ratio=data_args.empty_transcripts_ratio,
+                                            train_with_diar_outputs=data_args.train_with_diar_outputs,
+                                            audio_path_prefix=data_args.audio_path_prefix,
+                                            audio_path_prefix_replacement=data_args.audio_path_prefix_replacement,
+                                            vad_from_alignments=data_args.vad_from_alignments,
+                                            random_sentence_l_crop_p=data_args.random_sentence_l_crop_p,
+                                            random_sentence_r_crop_p=data_args.random_sentence_r_crop_p,
+                                            max_l_crop=data_args.max_l_crop,
+                                            max_r_crop=data_args.max_r_crop,
+                                            )
 
     # 3. Initialize container class
     container_cls = WhisperQKContainer if model_args.use_qk_biasing else WhisperContainer

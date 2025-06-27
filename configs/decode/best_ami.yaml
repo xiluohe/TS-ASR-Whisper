@@ -4,11 +4,11 @@ experiment: "ami_decode_test"
 
 model:
   whisper_model: "openai/whisper-large-v3"
-  reinit_from: "${oc.env:PRETRAINED_MODEL_PATH}"
+  reinit_from: "${oc.env:PRETRAINED_MODEL_PATH}/models--BUT-FIT--DiCoW_v2/snapshots/0b5d28e790014a93d9a45602c114ef6aadfc7271/model.safetensors"
 data:
-  eval_cutsets: "${oc.env:AMI_EVAL_DATA_PATH}" # TODO: Replace with MANIFEST_DIR
+  eval_cutsets: ${oc.env:MANIFEST_DIR}/ami-sdm_test_sc_cutset.jsonl.gz
   audio_path_prefix: ${oc.env:AMI_AUDIO_PATH_PREFIX}
   audio_path_prefix_replacement: ${oc.env:AMI_AUDIO_PATH_PREFIX_REPLACEMENT}
 training:
   decode_only: true
-  eval_metrics_list: [ "tcp_wer", "cp_wer", "tcorc_wer" ]
+  eval_metrics_list: [ "tcorc_wer" ]

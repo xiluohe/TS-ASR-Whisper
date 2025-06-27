@@ -24,7 +24,8 @@ def save_wer_visualization(ref, hyp, out_dir):
     assert list(ref.keys())[0] == list(hyp.keys())[0]
 
     meeting_name = list(ref.keys())[0]
-    av = AlignmentVisualization(ref[meeting_name], hyp[meeting_name], alignment='tcp')
+    # av = AlignmentVisualization(ref[meeting_name], hyp[meeting_name], alignment='tcp')
+    av = AlignmentVisualization(ref[meeting_name], hyp[meeting_name], alignment='tcorc')
     # Create standalone HTML file
     av.dump(os.path.join(out_dir, 'viz.html'))
 

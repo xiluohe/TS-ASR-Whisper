@@ -158,6 +158,12 @@ class DataArguments:
         "help": "Path to file with dev diar cutset (Lhotse format)"})
     eval_diar_cutsets: Optional[List[str]] = field(default=None, metadata={
         "help": "Path to file with eval diar cutset (Lhotse format)"})
+    use_heat_diar: Optional[bool] = field(default=False, metadata={
+        "help": "Use HEAT-style diarization."})
+    num_heat_channels: Optional[int] = field(default=2, metadata={
+        "help": "Number of HEAT channels for HEAT-style diarization."})
+    oracle_heat_assignment_method: Optional[str] = field(default='standard', metadata={
+        "help": "HEAT-style diarization channel assignment method."})
 
     def __post_init__(self):
         if isinstance(self.train_cutsets, str):

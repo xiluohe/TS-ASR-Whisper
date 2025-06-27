@@ -2,7 +2,7 @@
 defaults:
   - /train/icassp/table1_final-models/base
 
-experiment: DEFAULT_DICOW_MD
+experiment: HEAT_ASSIGNkeepchannel_MD
 
 data:
   train_cutsets:
@@ -12,7 +12,9 @@ data:
   - ${oc.env:MANIFEST_DIR}/notsofar_train_sc_cutset_30s.jsonl.gz
   dev_cutsets: ${oc.env:MANIFEST_DIR}/ami_notsofar_dev_sc_cutset.jsonl.gz
   eval_cutsets: ${oc.env:MANIFEST_DIR}/ami_notsofar_eval_sc_cutset.jsonl.gz
-  
+  use_heat_diar: true
+  oracle_heat_assignment_method: "keepchannel"
+
 training:
   metric_for_best_model: tcorc_wer
   train_metrics_list: ["tcorc_wer"]

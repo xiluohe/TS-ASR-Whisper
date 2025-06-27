@@ -44,6 +44,9 @@ data:
   vad_from_alignments: false
   cache_features_for_dev: false
   dataset_weights: null
+  use_heat_diar: false
+  num_heat_channels: 2
+  oracle_heat_assignment_method: "standard"
 
 decoding:
   decoding_ctc_weight: 0.0
@@ -68,7 +71,7 @@ training:
   per_device_eval_batch_size: 4
   max_steps: 50000
   num_train_epochs: 10
-  early_stopping_patience: 5
+  early_stopping_patience: 5 # Stop training if the performance doesn't improve in early_stopping_patience epochs 
   gradient_accumulation_steps: 1
   learning_rate: 2e-6
   warmup_steps: 2000
@@ -101,4 +104,4 @@ hydra:
   output_subdir: null
 
 wandb:
-  project: "chime2024_ts_asr_whisper"
+  project: "tswhisper"

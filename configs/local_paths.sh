@@ -3,17 +3,17 @@
 # The following lines may not be necessary, adjust them according to your setup.
 unset PYTHONPATH
 unset PYTHONHOME
-source /path/to/.bashrc  # Source the user's bash configuration
+source ~/.bashrc  # Source the user's bash configuration
 conda activate ts_asr_whisper  # Activate the freshly-created Conda environment.
 
 # Root directory of the source code.
-export SRC_ROOT=
+export SRC_ROOT=/export/fs06/xhe69/TS-ASR-Whisper
 
 # Name of the Weights & Biases project.
-export WANDB_PROJECT=
+export WANDB_PROJECT=tswhisper
 
 # Weights & Biases entity (username or team name).
-export WANDB_ENTITY=
+export WANDB_ENTITY=jsalt2025_xiluo
 
 # Run ID for Weights & Biases, using the EXPERIMENT variable. This variable is automatically set in the Python code, no need to change.
 export WANDB_RUN_ID="${EXPERIMENT}"
@@ -21,7 +21,7 @@ export WANDB_RUN_ID="${EXPERIMENT}"
 export HF_TOKEN=""
 
 # Cache directory for Hugging Face models.
-export HF_HOME=
+export HF_HOME=/export/fs06/xhe69/hf_cache
 
 # Set to 0 for online mode with Hugging Face Hub.
 export HF_HUB_OFFLINE=0
@@ -56,8 +56,9 @@ export LIBRI_DEV_CACHED_PATH=
 
 # Path to pretrained CTC models.
 # Is used in the yaml config files. You can leave this var empty but then you must set the path in the corresponding yaml config file.
-export PRETRAINED_CTC_MODELS_PATH=
+export PRETRAINED_CTC_MODELS_PATH="${SRC_ROOT}/pretrained_models"
 
 # Path to the pretrained model checkpoint.
 # Is used in the yaml config files. You can leave this var empty but then you must set the path in the corresponding yaml config file.
-export PRETRAINED_MODEL_PATH=
+export PRETRAINED_MODEL_PATH="${SRC_ROOT}/pretrained_models"
+

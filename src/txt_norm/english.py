@@ -584,6 +584,8 @@ class EnglishTextNormalizer:
             r"\bshoulda\b": "should have",
             r"\bma'am\b": "madam",
             r"\bokay\b": "ok",
+            r"\bkay\b": "ok",
+            r"\byep\b": "yeah",
             r"\bsetup\b": "set up",
             r"\beveryday\b": "every day",
             # contractions in titles/prefixes
@@ -640,6 +642,7 @@ class EnglishTextNormalizer:
 
         if remove_fillers:
             self.fillers = ['hmm', 'uh', 'ah', 'eh']  # assumes replacers have been applied
+            self.fillers.append('yeah')
         else:
             self.fillers = None
 

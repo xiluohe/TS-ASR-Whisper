@@ -7,7 +7,7 @@ import torch.utils.checkpoint
 import torch.utils.checkpoint
 import wandb
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, LSTM
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.logits_process import (
     LogitsProcessorList,
@@ -165,7 +165,8 @@ class WhisperForCTCConfig(WhisperConfig):
             target_amp_use_target: bool = True,
             target_amp_use_overlap: bool = True,
             target_amp_use_non_target: bool = True,
-            remove_timestamps_from_ctc: bool = False,
+            remove_timestamps_from_ctc: bool = False, 
+            use_channel_joiner: bool = False,
             apply_target_amp_to_n_layers: int = -1,
             target_amp_init: str = 'non-disturbing',  # random, non-disturbing, dispargement
             n_soft_prompts: int = 16,
@@ -189,10 +190,12 @@ class WhisperForCTCConfig(WhisperConfig):
         self.target_amp_use_overlap = target_amp_use_overlap
         self.target_amp_use_non_target = target_amp_use_non_target
         self.remove_timestamps_from_ctc = remove_timestamps_from_ctc
+        self.use_channel_joiner = use_channel_joiner
         self.apply_target_amp_to_n_layers = apply_target_amp_to_n_layers
         self.target_amp_init = target_amp_init
         self.n_soft_prompts = n_soft_prompts
         self.mt_num_speakers = mt_num_speakers
+        self.num_heat_channels = 2
 
 
 _HIDDEN_STATES_START_POSITION = 2
@@ -264,12 +267,11 @@ class TargetSpeakerAmplifier(nn.Module):
         else:
             orig_hidden_states = hidden_states
             hidden_states = (self.silence_linear(
-                orig_hidden_states) if self.use_silence else orig_hidden_states) * vad_mask[:, 0, :] + \
+                                orig_hidden_states) if self.use_silence else orig_hidden_states) * vad_mask[:, 0, :] + \
                             (self.target_linear(
                                 orig_hidden_states) if self.use_target else orig_hidden_states) * vad_mask[:, 1, :] + \
                             (self.non_target_linear(
-                                orig_hidden_states) if self.use_non_target else orig_hidden_states) * vad_mask[:, 2,
-                                                                                                      :] + \
+                                orig_hidden_states) if self.use_non_target else orig_hidden_states) * vad_mask[:, 2, :] + \
                             (self.overlap_linear(
                                 orig_hidden_states) if self.use_overlap else orig_hidden_states) * vad_mask[:, 3, :]
         return hidden_states
@@ -401,6 +403,8 @@ class WhisperEncoderForCTC(WhisperEncoder):
             with torch.no_grad():
                 embed_positions = module.embed_positions.weight
                 embed_positions.copy_(sinusoids(*embed_positions.shape))
+        elif isinstance(module, nn.Parameter):
+            module.weight.data.zero_()
 
     @classmethod
     def _load_pretrained_model(
@@ -466,7 +470,8 @@ class WhisperEncoderForCTC(WhisperEncoder):
             output_hidden_states=None,
             return_dict=None,
             vad_mask=None,
-            per_group_sizes=None
+            per_group_sizes=None,
+            training=False,
     ):
         # For MT-ASR the input has shape (B X S) x F x T
         # we can use torch.view(B, S, F, -1) to obtain
@@ -595,10 +600,296 @@ class WhisperEncoderForCTC(WhisperEncoder):
         )
 
 
+class HeatJoinerWhisperEncoderForCTC(WhisperEncoderForCTC):
+    config_class = WhisperForCTCConfig
+
+    def __init__(self, config: WhisperForCTCConfig):
+        super().__init__(config)
+        self.ln = nn.LayerNorm(config.d_model*2)
+        self.joiner = LSTM(
+            input_size=config.d_model * config.num_heat_channels, 
+            hidden_size=config.d_model, 
+            num_layers=1, 
+            bias=False, 
+            batch_first=True, 
+            dropout=0.0, 
+            bidirectional=False
+        )
+        # self.lstm_alpha = nn.Parameter(torch.tensor([1e-6]))
+        
+
+    def forward(
+            self,
+            input_features,
+            attention_mask=None,
+            head_mask=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            vad_mask=None,
+            per_group_sizes=None,
+            training=False,
+    ):
+        vad_mask_stream1 = vad_mask
+        vad_mask_stream2 = vad_mask.clone()
+
+        for b in range(len(vad_mask_stream2)):
+            stream2_target = vad_mask_stream2[b][1]
+            stream2_nontarget = vad_mask_stream2[b][2]
+            vad_mask_stream2[b][2] = stream2_target
+            vad_mask_stream2[b][1] = stream2_nontarget
+
+        # For MT-ASR the input has shape (B X S) x F x T
+        # we can use torch.view(B, S, F, -1) to obtain
+        # new tensor with speaker dim
+        expected_seq_length = self.config.max_source_positions * self.conv1.stride[0] * self.conv2.stride[0]
+        if input_features.shape[-1] != expected_seq_length:
+            if input_features.shape[-1] > expected_seq_length:
+                return CausalLMOutput(
+                    logits=None,
+                    hidden_states=None,
+                    attentions=None,
+                )
+            else:
+                raise ValueError(
+                    f"Whisper expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
+                )
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
+        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        embed_pos_stream1 = self.embed_positions.weight
+        if hasattr(self, "shift_embeds") and self.shift_embeds:
+            embed_pos_stream1 = embed_pos_stream1[
+                torch.clamp(((vad_mask_stream1[:, 1, :] + vad_mask_stream1[:, 3, :]).cumsum(dim=-1) - 1), min=0).to(torch.long)]
+
+        hidden_states_stream1 = inputs_embeds + embed_pos_stream1
+
+        hidden_states_stream1 = nn.functional.dropout(hidden_states_stream1, p=self.dropout, training=self.training)
+
+        encoder_states_stream1 = () if output_hidden_states else None
+        all_attentions_stream1 = () if output_attentions else None
+
+        # check if head_mask has a correct number of layers specified if desired
+        if head_mask is not None:
+            assert head_mask.size()[0] == (
+                len(self.layers)
+            ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+
+        for idx, encoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                encoder_states_stream1 = encoder_states_stream1 + (hidden_states_stream1,)
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            to_drop = False
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:  # skip the layer
+                    to_drop = True
+
+            if self.config.use_target_amplifiers and idx < len(self.target_amplifiers):
+                hidden_states_stream1 = self.target_amplifiers[idx](hidden_states_stream1, vad_mask_stream1)
+
+            if to_drop:
+                layer_outputs_stream1 = (None, None)
+            else:
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs_stream1 = self._gradient_checkpointing_func(
+                        encoder_layer.__call__,
+                        hidden_states_stream1,
+                        None,
+                        (head_mask[idx] if head_mask is not None else None),
+                        output_attentions,
+                    )
+                else:
+                    layer_outputs_stream1 = encoder_layer(
+                        hidden_states_stream1,
+                        None,
+                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        output_attentions=output_attentions,
+                    )
+
+                hidden_states_stream1 = layer_outputs_stream1[0]
+
+            if output_attentions:
+                all_attentions_stream1 = all_attentions_stream1 + (layer_outputs_stream1[1],)
+
+        hidden_states_stream1 = self.layer_norm(hidden_states_stream1)
+        if output_hidden_states:
+            encoder_states_stream1 = encoder_states_stream1 + (hidden_states_stream1,)
+
+        if not return_dict:
+            outputs_stream1 = tuple(v for v in [hidden_states_stream1, encoder_states_stream1, all_attentions_stream1] if v is not None)
+        else:
+            outputs_stream1 = BaseModelOutput(
+                last_hidden_state=hidden_states_stream1, hidden_states=encoder_states_stream1, attentions=all_attentions_stream1
+            )
+
+        if hasattr(self, "interaction"):
+            outputs_stream1.last_hidden_state = self.interaction(
+                outputs_stream1.last_hidden_state,
+                per_group_sizes
+            )
+            outputs_stream1.hidden_states = (*outputs_stream1.hidden_states[:-1], outputs_stream1.last_hidden_state)
+
+        if self.config.additional_layer:
+            inter_output_stream1, = self.additional_layer(
+                outputs_stream1.last_hidden_state,
+                attention_mask=None,
+                output_attentions=output_attentions,
+                layer_head_mask=None,
+            )
+        elif self.config.additional_self_attention_layer:
+            inter_output_stream1, _, __ = self.additional_self_attention_layer(
+                outputs_stream1.last_hidden_state,
+                attention_mask=None,
+                output_attentions=output_attentions,
+                layer_head_mask=None,
+            )
+        else:
+            inter_output_stream1 = outputs_stream1.last_hidden_state
+
+        inter_output_stream1 = self.final_dropout(inter_output_stream1)
+        
+
+        with torch.no_grad():
+            embed_pos_stream2 = self.embed_positions.weight
+
+            if hasattr(self, "shift_embeds") and self.shift_embeds:
+                embed_pos_stream2 = embed_pos_stream2[
+                    torch.clamp(((vad_mask_stream2[:, 1, :] + vad_mask_stream2[:, 3, :]).cumsum(dim=-1) - 1), min=0).to(torch.long)]
+
+            hidden_states_stream2 = inputs_embeds + embed_pos_stream2
+
+            encoder_states_stream2 = () if output_hidden_states else None
+            all_attentions_stream2 = () if output_attentions else None
+
+            for idx, encoder_layer in enumerate(self.layers):
+                if output_hidden_states:
+                    encoder_states_stream2 = encoder_states_stream2 + (hidden_states_stream2,)
+                # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+                to_drop = False
+
+                if self.config.use_target_amplifiers and idx < len(self.target_amplifiers):
+                    hidden_states_stream2 = self.target_amplifiers[idx](hidden_states_stream2, vad_mask_stream2)
+
+                layer_outputs_stream2 = encoder_layer(
+                    hidden_states_stream2,
+                    None,
+                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                    output_attentions=output_attentions,
+                )
+
+                hidden_states_stream2 = layer_outputs_stream2[0]
+
+                if output_attentions:
+                    all_attentions_stream2 = all_attentions_stream2 + (layer_outputs_stream2[1],)
+
+
+            hidden_states_stream2 = self.layer_norm(hidden_states_stream2)
+            if output_hidden_states:
+                encoder_states_stream2 = encoder_states_stream2 + (hidden_states_stream2,)
+            if not return_dict:
+                outputs_stream2 = tuple(v for v in [hidden_states_stream2, encoder_states_stream2, all_attentions_stream2] if v is not None)
+            else:
+                outputs_stream2 = BaseModelOutput(
+                    last_hidden_state=hidden_states_stream2, hidden_states=encoder_states_stream2, attentions=all_attentions_stream2
+                )
+            if hasattr(self, "interaction"):
+                outputs_stream2.last_hidden_state = self.interaction(
+                    outputs_stream2.last_hidden_state,
+                    per_group_sizes
+                )
+                outputs_stream2.hidden_states = (*outputs_stream2.hidden_states[:-1], outputs_stream2.last_hidden_state)
+
+            if self.config.additional_layer:
+                inter_output_stream2, = self.additional_layer(
+                    outputs_stream2.last_hidden_state,
+                    attention_mask=None,
+                    output_attentions=output_attentions,
+                    layer_head_mask=None,
+                )
+            elif self.config.additional_self_attention_layer:
+                inter_output_stream2, _, __ = self.additional_self_attention_layer(
+                    outputs_stream2.last_hidden_state,
+                    attention_mask=None,
+                    output_attentions=output_attentions,
+                    layer_head_mask=None,
+                )
+            else:
+                inter_output_stream2 = outputs_stream2.last_hidden_state
+
+        if training:
+            joined_output_stream = self.ln(torch.cat([inter_output_stream2, 
+                                            inter_output_stream1], axis=2))
+        
+            joined_output_stream, _ = self.joiner(joined_output_stream)
+
+            joined_output_stream2 = self.ln(torch.cat([inter_output_stream1, 
+                                         inter_output_stream2], axis=2))
+            joined_output_stream2, _ = self.joiner(joined_output_stream2)
+
+            outputs_stream1_hidden_states = list(outputs_stream1.hidden_states)
+            outputs_stream1_hidden_states[-1] = joined_output_stream
+            outputs_stream1.hidden_states = tuple(outputs_stream1_hidden_states)
+
+            outputs_stream2_hidden_states = list(outputs_stream2.hidden_states)
+            outputs_stream2_hidden_states[-1] = joined_output_stream2
+            outputs_stream2.hidden_states = tuple(outputs_stream2_hidden_states)
+
+            if self.config.sub_sample:
+                joined_output_stream = self.subsample_conv2(self.subsample_conv1(joined_output_stream.transpose(1, 2))).transpose(1, 2)
+                joined_output_stream2 = self.subsample_conv2(self.subsample_conv1(joined_output_stream2.transpose(1, 2))).transpose(1, 2)
+            logits = self.lm_head(joined_output_stream)
+            logits2 = self.lm_head(joined_output_stream2)
+
+            return (CausalLMOutput(
+                logits=logits,
+                # hidden_states=tuple(list(outputs_stream1.hidden_states) + [joined_output_stream_out]),
+                hidden_states=outputs_stream1.hidden_states,
+                attentions=outputs_stream1.attentions,
+            ), CausalLMOutput(
+                logits=logits2,
+                # hidden_states=tuple(list(outputs_stream1.hidden_states) + [joined_output_stream_out]),
+                hidden_states=outputs_stream2.hidden_states,
+                attentions=outputs_stream2.attentions,
+            )
+            )
+
+        else:
+            joined_output_stream = self.ln(torch.cat([inter_output_stream2, 
+                                            inter_output_stream1], axis=2))
+            with torch.backends.cudnn.flags(enabled=False):
+                joined_output_stream, _ = self.joiner(joined_output_stream)
+            
+            outputs_stream1_hidden_states = list(outputs_stream1.hidden_states)
+            outputs_stream1_hidden_states[-1] = joined_output_stream
+            outputs_stream1.hidden_states = tuple(outputs_stream1_hidden_states)
+
+            if self.config.sub_sample:
+                joined_output_stream = self.subsample_conv2(self.subsample_conv1(joined_output_stream.transpose(1, 2))).transpose(1, 2)
+            logits = self.lm_head(joined_output_stream)
+
+            return CausalLMOutput(
+                logits=logits,
+                # hidden_states=tuple(list(outputs_stream1.hidden_states) + [joined_output_stream_out]),
+                hidden_states=outputs_stream1.hidden_states,
+                attentions=outputs_stream1.attentions,
+            )
+    
 class WhisperModelWithCTC(WhisperModel):
     def __init__(self, config):
         super().__init__(config)
-        self.encoder = WhisperEncoderForCTC(config)
+        if not config.use_channel_joiner:
+            self.encoder = WhisperEncoderForCTC(config)
+        else:
+            self.encoder = HeatJoinerWhisperEncoderForCTC(config)
+        self.use_channel_joiner = config.use_channel_joiner
 
     def forward(
             self,
@@ -656,42 +947,100 @@ class WhisperModelWithCTC(WhisperModel):
                 head_mask=head_mask,
                 return_dict=return_dict,
                 vad_mask=vad_mask,
-                per_group_sizes=per_group_sizes
+                per_group_sizes=per_group_sizes,
+                training=True
             )
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         # elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
         #     raise ValueError("encoder_outputs should be of type BaseModelOutput when return_dict=True.")
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
-        decoder_outputs = self.decoder(
-            input_ids=decoder_input_ids,
-            attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_outputs.hidden_states[-1],
-            head_mask=decoder_head_mask,
-            cross_attn_head_mask=cross_attn_head_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=decoder_inputs_embeds,
-            position_ids=decoder_position_ids,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        # print(f'The length of encoder outputs is {len(encoder_outputs)}')
+        if isinstance(encoder_outputs, tuple) and len(encoder_outputs) == 2:
+            decoder_outputs1 = self.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=decoder_attention_mask,
+                encoder_hidden_states=encoder_outputs[0].hidden_states[-1],
+                head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=decoder_inputs_embeds,
+                position_ids=decoder_position_ids,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            decoder_outputs2 = self.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=decoder_attention_mask,
+                encoder_hidden_states=encoder_outputs[1].hidden_states[-1],
+                head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=decoder_inputs_embeds,
+                position_ids=decoder_position_ids,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
 
-        if not return_dict:
-            return decoder_outputs + encoder_outputs
+            if not return_dict:
+                return (decoder_outputs1 + encoder_outputs[0], decoder_outputs2 + encoder_outputs[1])
 
-        return Seq2SeqModelOutputLogit(
-            last_hidden_state=decoder_outputs.last_hidden_state,
-            past_key_values=decoder_outputs.past_key_values,
-            decoder_hidden_states=decoder_outputs.hidden_states,
-            decoder_attentions=decoder_outputs.attentions,
-            cross_attentions=decoder_outputs.cross_attentions,
-            encoder_last_hidden_state=encoder_outputs.hidden_states[-1],
-            encoder_hidden_states=encoder_outputs.hidden_states,
-            encoder_attentions=encoder_outputs.attentions,
-            encoder_logits=encoder_outputs.logits,
-        )
+            return (Seq2SeqModelOutputLogit(
+                last_hidden_state=decoder_outputs1.last_hidden_state,
+                past_key_values=decoder_outputs1.past_key_values,
+                decoder_hidden_states=decoder_outputs1.hidden_states,
+                decoder_attentions=decoder_outputs1.attentions,
+                cross_attentions=decoder_outputs1.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs[0].hidden_states[-1],
+                encoder_hidden_states=encoder_outputs[0].hidden_states,
+                encoder_attentions=encoder_outputs[0].attentions,
+                encoder_logits=encoder_outputs[0].logits,
+            ), Seq2SeqModelOutputLogit(
+                last_hidden_state=decoder_outputs2.last_hidden_state,
+                past_key_values=decoder_outputs2.past_key_values,
+                decoder_hidden_states=decoder_outputs2.hidden_states,
+                decoder_attentions=decoder_outputs2.attentions,
+                cross_attentions=decoder_outputs2.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs[1].hidden_states[-1],
+                encoder_hidden_states=encoder_outputs[1].hidden_states,
+                encoder_attentions=encoder_outputs[1].attentions,
+                encoder_logits=encoder_outputs[1].logits,
+            )
+            )
+        else:
+            decoder_outputs = self.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=decoder_attention_mask,
+                encoder_hidden_states=encoder_outputs.hidden_states[-1],
+                head_mask=decoder_head_mask,
+                cross_attn_head_mask=cross_attn_head_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=decoder_inputs_embeds,
+                position_ids=decoder_position_ids,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            if not return_dict:
+                return decoder_outputs + encoder_outputs
+
+            return Seq2SeqModelOutputLogit(
+                last_hidden_state=decoder_outputs.last_hidden_state,
+                past_key_values=decoder_outputs.past_key_values,
+                decoder_hidden_states=decoder_outputs.hidden_states,
+                decoder_attentions=decoder_outputs.attentions,
+                cross_attentions=decoder_outputs.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs.hidden_states[-1],
+                encoder_hidden_states=encoder_outputs.hidden_states if not self.use_channel_joiner else encoder_outputs.hidden_states[:-1],
+                encoder_attentions=encoder_outputs.attentions,
+                encoder_logits=encoder_outputs.logits,
+            )
 
 
 class WhisperForConditionalGenerationWithCTC(WhisperForConditionalGeneration):
@@ -773,6 +1122,18 @@ class WhisperForConditionalGenerationWithCTC(WhisperForConditionalGeneration):
             module.reset_parameters()
         elif isinstance(module, nn.MultiheadAttention):
             module._reset_parameters()
+        elif isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data)
+                elif 'bias_ih' in name:
+                    # Set forget gate bias to 1.0
+                    n = param.size(0)
+                    param.data[n//4:n//2].fill_(1.0)
+                elif 'bias_hh' in name:
+                    param.data.zero_()
 
     def forward(
             self,
@@ -854,50 +1215,105 @@ class WhisperForConditionalGenerationWithCTC(WhisperForConditionalGeneration):
             per_group_sizes=per_group_sizes
         )
 
-        dec_lm_logits = self.proj_out(outputs.last_hidden_state)
-        enc_lm_logits = outputs.encoder_logits
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            dec_lm_logits1 = self.proj_out(outputs[0].last_hidden_state)
+            enc_lm_logits1 = outputs[0].encoder_logits
+            dec_lm_logits2 = self.proj_out(outputs[1].last_hidden_state)
+            enc_lm_logits2 = outputs[1].encoder_logits
 
-        loss = None
-        ctc_loss = 0
-        if labels is not None and self.ctc_weight > 0.0:
-            enc_labels = labels.clone()
-            for token in self.tokenizer.prefix_tokens:
-                if (enc_labels[:, 0] == token).all():
-                    enc_labels = enc_labels[:, 1:]
-            enc_labels[enc_labels == self.config.eos_token_id] = -100
+            loss = None
+            ctc_loss = 0
+            if labels is not None and self.ctc_weight > 0.0:
+                enc_labels = labels.clone()
+                for token in self.tokenizer.prefix_tokens:
+                    if (enc_labels[:, 0] == token).all():
+                        enc_labels = enc_labels[:, 1:]
+                enc_labels[enc_labels == self.config.eos_token_id] = -100
 
-            ctc_loss = self.get_encoder().get_loss(enc_lm_logits, enc_labels)
-            if wandb.run is not None:
-                wandb.log({"ctc_loss": ctc_loss})
+                ctc_loss1 = self.get_encoder().get_loss(enc_lm_logits1, enc_labels)
+                ctc_loss2 = self.get_encoder().get_loss(enc_lm_logits2, enc_labels)
+                ctc_loss = (ctc_loss1 + ctc_loss2) / 2
+                if wandb.run is not None:
+                    wandb.log({"ctc_loss": ctc_loss})
 
-        if labels is not None:
-            loss_fct = CrossEntropyLoss(reduction='none')
-            # move labels to correct device to enable PP
-            labels = labels.to(dec_lm_logits.device)
-            dec_loss1 = loss_fct(dec_lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
-            dec_loss2 = loss_fct(dec_lm_logits.view(-1, self.config.vocab_size), upp_labels.reshape(-1))
-            dec_loss = torch.hstack((dec_loss1[..., None], dec_loss2[..., None])).min(dim=-1).values.mean()
-            loss = (1 - self.ctc_weight) * dec_loss + self.ctc_weight * ctc_loss
+            if labels is not None:
+                loss_fct = CrossEntropyLoss(reduction='none')
+                # move labels to correct device to enable PP
+                labels = labels.to(dec_lm_logits1.device)
+                dec_loss1_1 = loss_fct(dec_lm_logits1.view(-1, self.config.vocab_size), labels.reshape(-1))
+                dec_loss2_1 = loss_fct(dec_lm_logits1.view(-1, self.config.vocab_size), upp_labels.reshape(-1))
+                dec_loss1 = torch.hstack((dec_loss1_1[..., None], dec_loss2_1[..., None])).min(dim=-1).values.mean()
+                dec_loss1_2 = loss_fct(dec_lm_logits2.view(-1, self.config.vocab_size), labels.reshape(-1))
+                dec_loss2_2 = loss_fct(dec_lm_logits2.view(-1, self.config.vocab_size), upp_labels.reshape(-1))
+                dec_loss2 = torch.hstack((dec_loss1_2[..., None], dec_loss2_2[..., None])).min(dim=-1).values.mean()
+                dec_loss = (dec_loss1 + dec_loss2) / 2
+                loss = (1 - self.ctc_weight) * dec_loss + self.ctc_weight * ctc_loss
 
-            if wandb.run is not None:
-                wandb.log({"att_loss": dec_loss})
+                if wandb.run is not None:
+                    wandb.log({"att_loss": dec_loss})
 
-        if not return_dict:
-            output = (dec_lm_logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            if not return_dict:
+                output = (dec_lm_logits1,) + outputs[0][1:]
+                return ((loss,) + output[0]) if loss is not None else output[0]
 
-        return Seq2SeqLMOutputLosses(
-            loss=loss,
-            logits=dec_lm_logits,
-            past_key_values=outputs.past_key_values,
-            decoder_hidden_states=outputs.decoder_hidden_states,
-            decoder_attentions=outputs.decoder_attentions,
-            cross_attentions=outputs.cross_attentions,
-            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
-            encoder_hidden_states=outputs.encoder_hidden_states,
-            encoder_attentions=outputs.encoder_attentions,
-            encoder_logits=enc_lm_logits,
-        )
+            return Seq2SeqLMOutputLosses(
+                loss=loss,
+                logits=dec_lm_logits1,
+                past_key_values=outputs[0].past_key_values,
+                decoder_hidden_states=outputs[0].decoder_hidden_states,
+                decoder_attentions=outputs[0].decoder_attentions,
+                cross_attentions=outputs[0].cross_attentions,
+                encoder_last_hidden_state=outputs[0].encoder_last_hidden_state,
+                encoder_hidden_states=outputs[0].encoder_hidden_states,
+                encoder_attentions=outputs[0].encoder_attentions,
+                encoder_logits=enc_lm_logits1,
+            )
+        
+        else:
+            dec_lm_logits = self.proj_out(outputs.last_hidden_state)
+            enc_lm_logits = outputs.encoder_logits
+
+            loss = None
+            ctc_loss = 0
+            if labels is not None and self.ctc_weight > 0.0:
+                enc_labels = labels.clone()
+                for token in self.tokenizer.prefix_tokens:
+                    if (enc_labels[:, 0] == token).all():
+                        enc_labels = enc_labels[:, 1:]
+                enc_labels[enc_labels == self.config.eos_token_id] = -100
+
+                ctc_loss = self.get_encoder().get_loss(enc_lm_logits, enc_labels)
+                if wandb.run is not None:
+                    wandb.log({"ctc_loss": ctc_loss})
+
+            if labels is not None:
+                loss_fct = CrossEntropyLoss(reduction='none')
+                # move labels to correct device to enable PP
+                labels = labels.to(dec_lm_logits.device)
+                dec_loss1 = loss_fct(dec_lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
+                dec_loss2 = loss_fct(dec_lm_logits.view(-1, self.config.vocab_size), upp_labels.reshape(-1))
+                dec_loss = torch.hstack((dec_loss1[..., None], dec_loss2[..., None])).min(dim=-1).values.mean()
+                loss = (1 - self.ctc_weight) * dec_loss + self.ctc_weight * ctc_loss
+
+                if wandb.run is not None:
+                    wandb.log({"att_loss": dec_loss})
+
+            if not return_dict:
+                output = (dec_lm_logits,) + outputs[1:]
+                return ((loss,) + output) if loss is not None else output
+
+            return Seq2SeqLMOutputLosses(
+                loss=loss,
+                logits=dec_lm_logits,
+                past_key_values=outputs.past_key_values,
+                decoder_hidden_states=outputs.decoder_hidden_states,
+                decoder_attentions=outputs.decoder_attentions,
+                cross_attentions=outputs.cross_attentions,
+                encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+                encoder_hidden_states=outputs.encoder_hidden_states,
+                encoder_attentions=outputs.encoder_attentions,
+                encoder_logits=enc_lm_logits,
+            )
 
     def _get_feat_extract_output_lengths(self, attention_mask: torch.Tensor) -> torch.Tensor:
         return (self.model.encoder._get_feat_extract_output_lengths(attention_mask) / 4).ceil()

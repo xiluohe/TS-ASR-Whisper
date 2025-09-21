@@ -19,7 +19,7 @@ def supports_flash_attention():
 class WhisperContainer:
     def __init__(self, model_type='whisper-tiny', proc_diar_mask=True, pretrained_encoder=None, ctc_weight=0.0,
                  shift_pos_embeds=False, training_args=None, predict_timestamps=False, use_target_amplifiers=True,
-                 vad_seek_callback=None, remove_timestamps_from_ctc=False, **kwargs):
+                 vad_seek_callback=None, remove_timestamps_from_ctc=False, use_channel_joiner=False, **kwargs):
         self.model_type = model_type
         self.proc_diar_mask = proc_diar_mask
         self.model = (WhisperForConditionalGenerationWithCTC
@@ -31,10 +31,10 @@ class WhisperContainer:
                                        sub_sample=True,
                                        additional_self_attention_layer=True,
                                        use_target_amplifiers=use_target_amplifiers,
+                                       use_channel_joiner=use_channel_joiner,
                                        remove_timestamps_from_ctc=remove_timestamps_from_ctc,
-                                       **kwargs
+                                       **kwargs 
                                        )
-
                       )
         if vad_seek_callback is not None:
             self.model.set_vad_seek_callback(vad_seek_callback)
@@ -241,17 +241,23 @@ class WhisperQKContainer(WhisperContainer):
         self.h.update_vad_mask(vad_mask)
 
 
-def get_optimizer(model, training_args, prefixes_with_higher_lr=None):
+def get_optimizer(model, training_args, prefixes_with_higher_lr=None, joiner_prefixes=None):
     if prefixes_with_higher_lr is None:
         prefixes_with_higher_lr = []
     if training_args.use_custom_optimizer:
         original_whisper_params = [param for name, param in model.named_parameters() if
-                                   not any([name.startswith(prefix) for prefix in prefixes_with_higher_lr])]
+                                   not any([name.startswith(prefix) for prefix in prefixes_with_higher_lr+joiner_prefixes])]
         new_params = [param for name, param in model.named_parameters() if
                       any([name.startswith(prefix) for prefix in prefixes_with_higher_lr])]
+        joiner_params = [param for name, param in model.named_parameters() if
+                      any([name.startswith(prefix) for prefix in joiner_prefixes])]
+        
         return torch.optim.AdamW([{'params': original_whisper_params},
                                   {'params': new_params,
                                    'lr': training_args.target_amp_lr_multiplier * training_args.learning_rate,
+                                   'weight_decay': 0.0},
+                                   {'params': joiner_params,
+                                   'lr': training_args.learning_rate,
                                    'weight_decay': 0.0}],
                                  lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
     else:

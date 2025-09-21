@@ -2,14 +2,19 @@
 defaults:
   - /train/icassp/table1_final-models/base
 
-experiment: HEAT_ASSIGNkeepchannel_MD
+experiment: HEAT_ASSIGNkeepchannel_MD_fixeddata
 
 data:
   train_cutsets:
+  - ${oc.env:MANIFEST_DIR}/notsofar_train_sc_cutset_30s.jsonl.gz
   - ${oc.env:MANIFEST_DIR}/ami-sdm_train_sc_cutset_30s.jsonl.gz
   - ${oc.env:MANIFEST_DIR}/libri2mix_both_100_train_sc_cutset_30s.jsonl.gz
-  - ${oc.env:MANIFEST_DIR}/libri2mix_clean_100_train_sc_cutset_30s.jsonl.gz
-  - ${oc.env:MANIFEST_DIR}/notsofar_train_sc_cutset_30s.jsonl.gz
+  - ${oc.env:MANIFEST_DIR}/libri2mix_both_360_train_sc_cutset_30s.jsonl.gz
+  dataset_weights:
+    - 3
+    - 3
+    - 1
+    - 1
   dev_cutsets: ${oc.env:MANIFEST_DIR}/ami_notsofar_dev_sc_cutset.jsonl.gz
   eval_cutsets: ${oc.env:MANIFEST_DIR}/ami_notsofar_eval_sc_cutset.jsonl.gz
   use_heat_diar: true
@@ -20,3 +25,6 @@ training:
   train_metrics_list: ["tcorc_wer"]
   eval_metrics_list: ["tcorc_wer"]
   eval_delay: 1
+
+
+#sbatch ./scripts/training/submit_slurm.sh +train=icassp/heat_conditioning/ami-heat-keepchannel

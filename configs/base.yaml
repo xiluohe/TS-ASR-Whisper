@@ -17,6 +17,8 @@ model:
   apply_target_amp_to_n_layers: -1  # Means all layers
   target_amp_init: "disparagement"
   prefixes_to_preheat: ['model.encoder.additional_layer', 'model.encoder.additional_self_attention_layer', 'model.encoder.lm_head', 'model.encoder.subsample_conv1', 'model.encoder.subsample_conv2', 'model.encoder.target_amplifiers', 'model.encoder.blank_projection', 'model.encoder.modifiers','model.encoder.target_embeddings_proj']
+  joiner_prefixes: []
+  use_channel_joiner: false
 data:
   use_libri: false
   libri_train_cached_path: ${oc.env:LIBRI_TRAIN_CACHED_PATH}
@@ -28,6 +30,7 @@ data:
   use_timestamps: true
   dev_decoding_samples: 1000
   train_with_diar_outputs: null
+  train_with_hard_diar_outputs: null
   train_text_norm: "whisper_nsf"
   eval_text_norm: "whisper_nsf"
   # musan_noises: ${oc.env:MUSAN_PATH}
@@ -47,6 +50,7 @@ data:
   use_heat_diar: false
   num_heat_channels: 2
   oracle_heat_assignment_method: "standard"
+  vad_mask_weights: false
 
 decoding:
   decoding_ctc_weight: 0.0
@@ -80,6 +84,7 @@ training:
   ddp_find_unused_parameters: false
   generation_max_length: 225
   predict_with_generate: true
+  max_grad_norm: 1.0
 
   eval_strategy: "epoch"
   save_strategy: "epoch"
@@ -93,7 +98,7 @@ training:
   do_train: true
   load_best_model_at_end: true
   logging_steps: 5
-  eval_delay: 2
+  eval_delay: 1
 
   output_dir: ${oc.env:EXPERIMENT_PATH}/${experiment}
   run_name: ${experiment}

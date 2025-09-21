@@ -175,6 +175,7 @@ wandb/
 configs/local_paths.sh
 
 diar_output/
+diar_exp/
 data/ami
 data/libri*
 data/manifests

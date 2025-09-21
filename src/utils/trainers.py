@@ -7,6 +7,7 @@ from transformers import Seq2SeqTrainer, Trainer
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import logging
 from transformers.trainer_pt_utils import get_model_param_count
+import wandb
 
 logging.set_verbosity_debug()
 logger = logging.get_logger("transformers")

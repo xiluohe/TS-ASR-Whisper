@@ -1,0 +1,27 @@
+# @package _global_
+
+# experiment: "libri3mix_dicow_oraclediar_md_beam5ctc02lp01"
+# experiment: "dicow_oraclediar_sd_greedy"
+# experiment: "libri3mix_dicow_oraclediar_md_greedy"
+
+experiment: "sparselibri2mix_dicow_oraclediar_sd_keepstream_greedy"
+
+model:
+  whisper_model: "openai/whisper-large-v3-turbo"
+  # reinit_from: "/export/fs06/xhe69/TS-ASR-Whisper/exp/DEFAULT_DICOW_MD_fixeddata/checkpoint-9988/model.safetensors"
+  reinit_from: "/export/fs06/xhe69/TS-ASR-Whisper/exp/DEFAULT_DICOW/checkpoint-8245/model.safetensors"
+data:
+  # eval_cutsets: ${oc.env:MANIFEST_DIR}/ami-sdm_test_sc_cutset.jsonl.gz
+  # eval_cutsets: ${oc.env:MANIFEST_DIR}/icsi-sdm_test_sc_cutset.jsonl.gz
+  # eval_cutsets: ${oc.env:MANIFEST_DIR}/libri3mix_mix_clean_sc_test_cutset.jsonl.gz
+  eval_cutsets: ${oc.env:MANIFEST_DIR}/sparselibrimix_mix_noisy_sparse_3_0.15_sc_test_cutset.jsonl.gz
+  audio_path_prefix: ${oc.env:AUDIO_PATH_PREFIX}
+  audio_path_prefix_replacement: ${oc.env:AUDIO_PATH_PREFIX_REPLACEMENT}
+training:
+  decode_only: true
+  eval_metrics_list: [ "tcorc_wer" ]
+  # generation_num_beams: 5
+decoding:
+  # decoding_ctc_weight: 0.2
+  condition_on_prev: false
+  # length_penalty: 0.1

@@ -9,7 +9,7 @@ if __name__ == '__main__':
     parser.add_argument('--input', type=str, required=True, help='Path to the input manifest')
     parser.add_argument('--output', type=str, required=True, help='Path to the output manifest')
     parser.add_argument('--max_len', type=int, default=30, help='Max length of the cut in seconds')
-    parser.add_argument('--num_jobs', type=int, default=32, help='Number of parallel jobs')
+    parser.add_argument('--num_jobs', type=int, default=16, help='Number of parallel jobs')
 
     args = parser.parse_args()
 

@@ -29,8 +29,6 @@ from utils.training_args import DataArguments, DecodingArguments
 from utils.general import round_nearest
 from concurrent.futures import ThreadPoolExecutor
 
-from data.segsot_transcript_preprocess import reorder_transcripts_with_alpha_beta as reorder_transcripts
-
 logging.set_verbosity_debug()
 logger = logging.get_logger("transformers")
 
@@ -58,17 +56,16 @@ class TS_ASR_DatasetSuperclass:
     """
 
     def __init__(self, cutsets, text_norm=lambda x: x, do_augment=False, use_timestamps=False,
-                 empty_transcript_ratio=0.00, train_with_hard_diar_outputs=None, musan_noises=None, audio_path_prefix=None,
+                 empty_transcript_ratio=0.00, musan_noises=None, audio_path_prefix=None,
                  audio_path_prefix_replacement=None,
-                 max_timestamp_pause=0.0, vad_from_alignments=False, vad_mask_weights=False,
+                 max_timestamp_pause=0.0, vad_from_alignments=False,
                  dataset_weights=None,
-                 num_heat_channels=2, oracle_heat_assignment_method='standard',
+                 num_heat_channels=2, heat_assignment_method='first-available',
                  *args,
                  **kwargs):
 
         self.num_heat_channels = num_heat_channels
-        self.oracle_heat_assignment_method = oracle_heat_assignment_method
-        self.vad_mask_weights = vad_mask_weights
+        self.heat_assignment_method = heat_assignment_method
 
         self.cutsets = cutsets
         self.dataset_weights = dataset_weights
@@ -91,7 +88,6 @@ class TS_ASR_DatasetSuperclass:
             self.noise_transform = RandomBackgroundNoise(16_000, musan_noises)
         self.use_timestamps = use_timestamps
         self.empty_transcript_ratio = empty_transcript_ratio
-        self.train_with_hard_diar_outputs = train_with_hard_diar_outputs
         self.max_timestamp_pause = max_timestamp_pause
         self.vad_from_alignments = vad_from_alignments  # If True, the vad mask will be created from the supervision alignments (useful for LSMix)
         self.alignment_keyword = 'word'  # We assume we're not gonna work with subword alignments for now.
@@ -153,7 +149,7 @@ class TS_ASR_DatasetSuperclass:
     def merge_supervisions(self, target_spk_cut, merge_adjacent=True):
         new_merged_list = []
         for supervision in sorted(target_spk_cut.supervisions, key=lambda x: x.start):
-            if  merge_adjacent:
+            if merge_adjacent:
                 if len(new_merged_list) == 0:
                     new_supervision = fastcopy(supervision, alignment=None, custom=None)
                     supervision.alignment = [new_supervision]
@@ -203,45 +199,19 @@ class TS_ASR_DatasetSuperclass:
                     "transcript": ""}
         speaker_mask = vad_mask # used to return the diarization output 
         s_index = spk_ids_2_idx[sid]
-        if self.train_with_hard_diar_outputs:
-            pass
-        # if self.train_with_diar_outputs is not None and cut.recording_id in ns_mapping_inverted.keys():
-        #     soft_labels = np.load(self.train_with_diar_outputs + cut.recording_id + "_soft_activations.npy")[
-        #                   round(cut.start / 0.02): round(cut.end / 0.02), :]
-        #     soft_reshaped = soft_labels.T[..., None].repeat(16_000 * 0.02, axis=-1).reshape((soft_labels.shape[1], -1))
-        #     pad_by = vad_mask.shape[1] - soft_reshaped.shape[1]
-        #     if pad_by > 0:
-        #         soft_padded = np.pad(soft_reshaped, ((0, 0), (0, vad_mask.shape[1] - soft_reshaped.shape[1])))
-        #     else:
-        #         soft_padded = soft_reshaped[:, -pad_by:]
-        #     spk_mask = soft_padded / 10
-        #     orig_indexes, mapping = self.find_soft_alignment(spk_mask, vad_mask)
-        #     if s_index not in orig_indexes:
-        #         # Was not able to align correctly return dummy tensor
-        #         vad_mask = np.zeros((4, vad_mask.shape[1]), dtype='bool')
-        #         vad_mask[0] = 1
-        #         return {"audio": audio.squeeze(axis=0), "vad_mask": vad_mask,
-        #                 "do_augment": self.do_augment,
-        #                 "transcript": ""}
 
-        #     s_index_new = mapping[orig_indexes == s_index].item()
-        #     labels_matched_by = (spk_mask[s_index_new] * vad_mask[s_index]).sum() / vad_mask[s_index].sum()
-        #     if labels_matched_by > 1.0:
-        #         vad_mask = self.create_soft_masks(spk_mask, s_index_new)
-        #     else:
-        #         vad_mask = self.create_soft_masks(vad_mask, s_index)
-        else: # ORACLE DIARIZATION 
-            target_spk = vad_mask[s_index] == 1
-            sil_frames = vad_mask.sum(axis=0) == 0
+        target_spk = vad_mask[s_index] == 1
+        sil_frames = vad_mask.sum(axis=0) == 0
 
-            non_target_mask = np.ones(vad_mask.shape[0], dtype="bool")
-            non_target_mask[s_index] = False
-            different_spk = vad_mask[non_target_mask].sum(axis=0) > 0
-            overlapping_speech = np.logical_and(different_spk, target_spk)
-            non_target_speaker = different_spk * ~target_spk
-            target_spk = target_spk * ~overlapping_speech
+        non_target_mask = np.ones(vad_mask.shape[0], dtype="bool")
+        non_target_mask[s_index] = False
+        different_spk = vad_mask[non_target_mask].sum(axis=0) > 0
+        overlapping_speech = np.logical_and(different_spk, target_spk)
+        non_target_speaker = different_spk * ~target_spk
+        target_spk = target_spk * ~overlapping_speech
 
-            vad_mask = np.stack([sil_frames, target_spk, non_target_speaker, overlapping_speech], axis=0)
+        vad_mask = np.stack([sil_frames, target_spk, non_target_speaker, overlapping_speech], axis=0)
+        
         if self.do_augment:
             audio, vad_mask = self.noise_transform(torch.from_numpy(audio), torch.from_numpy(vad_mask))
             concatenated = torch.vstack((vad_mask, audio))
@@ -311,10 +281,8 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
     def adjust_overlapping_transcription(self, segments):
         # if transcript is an enclave of another transcript (eg. both start and end times within the other transcript)
         # move the order that the transcript is appended together to which ever edge (ie start/end) the enclave is closer to
-        # based on... start time? end time? median time? (currently always after) 
-        # if enclave is of a certain length, maybe just remove it? 
-        # 3 overlaps? -> just let whatever logic i choose let it be bc it should be rare (ie no need to special case)
-        
+        # based on median time
+
         reordered = []
 
         i = 0
@@ -355,7 +323,7 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
             i += 1
         return reordered
 
-    def cut_to_sample(self, cut, stream_id): # do heat assignments the same (ie. channel assignment has to be systematic) both times it is called on the sample, with the difference being that it either indexes into first or second channel
+    def cut_to_sample(self, cut, stream_id): 
         audio = cut.load_audio()
 
         all_supervisions = []
@@ -363,105 +331,36 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
             target_spk_cut = cut.filter_supervisions(lambda x: x.speaker == sid)
             merged_supervisions = self.merge_supervisions(target_spk_cut, merge_adjacent=True)
 
-            all_supervisions = all_supervisions + merged_supervisions # this should have all supervision segments
+            all_supervisions = all_supervisions + merged_supervisions
         # Sort supervisions by starting time
         all_supervisions = sorted(all_supervisions, key=lambda sup: sup.start)
         heat_assignments = [[] for _ in range(self.num_heat_channels)]
         heat_channels = range(self.num_heat_channels)
 
-        # HEAT assignment into 2 channels 
-        if self.train_with_hard_diar_outputs:
-            pass
-        # if self.train_with_diar_outputs is not None and cut.recording_id in ns_mapping_inverted.keys(): # probably wrong args, currently just copied from above 
-            # pass # case of HEAT trained separator/diarizer
-
-
-            # load computed diarization outputs
-
-            # TODO: on the fly diarization - need to train diarization model with the WhisperFeatureExtractor used here  
-            # ie. feature_size 128, chunk_length 30, hop_length 160, n_fft 400, n_samples 480000, sr 16000 
-
-            # soft_labels = np.load(self.train_with_diar_outputs + cut.recording_id + "_soft_activations.npy")[
-            #               round(cut.start / 0.02): round(cut.end / 0.02), :]
-            # soft_reshaped = soft_labels.T[..., None].repeat(16_000 * 0.02, axis=-1).reshape((soft_labels.shape[1], -1))
-            # pad_by = vad_mask.shape[1] - soft_reshaped.shape[1]
-            # if pad_by > 0:
-            #     soft_padded = np.pad(soft_reshaped, ((0, 0), (0, vad_mask.shape[1] - soft_reshaped.shape[1])))
-            # else:
-            #     soft_padded = soft_reshaped[:, -pad_by:]
-            # spk_mask = soft_padded / 10
-            # orig_indexes, mapping = self.find_soft_alignment(spk_mask, vad_mask)
-            # if s_index not in orig_indexes:
-            #     # Was not able to align correctly return dummy tensor
-            #     vad_mask = np.zeros((4, vad_mask.shape[1]), dtype='bool')
-            #     vad_mask[0] = 1
-            #     return {"audio": audio.squeeze(axis=0), "vad_mask": vad_mask,
-            #             "do_augment": self.do_augment,
-            #             "transcript": ""}
-
-            # s_index_new = mapping[orig_indexes == s_index].item()
-            # labels_matched_by = (spk_mask[s_index_new] * vad_mask[s_index]).sum() / vad_mask[s_index].sum()
-            # if labels_matched_by > 1.0:
-            #     vad_mask = self.create_soft_masks(spk_mask, s_index_new)
-            # else:
-            #     vad_mask = self.create_soft_masks(vad_mask, s_index)
-
-            # @staticmethod
-            # def create_soft_masks(spk_mask, s_index):
-            #     non_target_mask = np.ones(spk_mask.shape[0], dtype="bool")
-            #     non_target_mask[s_index] = False
-            #     sil_frames = (1 - spk_mask).prod(axis=0)
-            #     anyone_else = (1 - spk_mask[non_target_mask]).prod(axis=0)
-            #     target_spk = spk_mask[s_index] * anyone_else
-            #     non_target_spk = (1 - spk_mask[s_index]) * (1 - anyone_else)
-            #     overlapping_speech = spk_mask[s_index] - target_spk
-            #     vad_mask = np.stack([sil_frames, target_spk, non_target_spk, overlapping_speech], axis=0)
-            #     return vad_mask
-
-                    
-        elif self.oracle_heat_assignment_method == 'alternate':
+        # HEAT assignment into 2 channels             
+        if self.heat_assignment_method == 'alternating':
             last_seg_end = [0 for _ in range(self.num_heat_channels)]
             last_channel_assigned = -1
             for sup in all_supervisions:
                 start, end = sup.start, sup.end_
 
                 possible_channels = []
-                # for i in range(self.num_heat_channels):
                 for i in heat_channels:
                     if start >= last_seg_end[i]:
                         possible_channels.append(i)
                 if len(possible_channels) > 1 and last_channel_assigned in possible_channels:
                     possible_channels.remove(last_channel_assigned) # Always alternate if possible
                 
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 streams case; 3+ streams case might want to do something better
+                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end))
                 heat_assignments[assignment_channel].append(sup)
                 last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
                 last_channel_assigned = assignment_channel
-        elif self.oracle_heat_assignment_method == 'keepchannel':
-            last_seg_end = [0 for _ in range(self.num_heat_channels)]
-            last_channel_assigned = -1
-            for sup in all_supervisions:
-                start, end = sup.start, sup.end_
-
-                possible_channels = []
-                # for i in range(self.num_heat_channels):
-                for i in heat_channels:
-                    if start >= last_seg_end[i]:
-                        possible_channels.append(i)
-                if last_channel_assigned in possible_channels:
-                    possible_channels = [last_channel_assigned] # use last_channel_assigned if it won't contain overlaps
-
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 streams case; 3+ streams case might want to do something better
-                heat_assignments[assignment_channel].append(sup)
-                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
-                last_channel_assigned = assignment_channel
-        elif self.oracle_heat_assignment_method == 'keepchannel_maxlastsegend':
+        elif self.heat_assignment_method == 'recency-continuity':
             last_seg_end = [0 for _ in range(self.num_heat_channels)]
             for sup in all_supervisions:
                 start, end = sup.start, sup.end_
 
                 possible_channels = []
-                # for i in range(self.num_heat_channels):
                 for i in heat_channels:
                     if start >= last_seg_end[i]:
                         possible_channels.append(i)
@@ -469,10 +368,10 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
                 if last_seg_end.index(max(last_seg_end)) in possible_channels:
                     possible_channels = [last_seg_end.index(max(last_seg_end))]
 
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 streams case; 3+ streams case might want to do something better
+                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end))
                 heat_assignments[assignment_channel].append(sup)
                 last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
-        elif self.oracle_heat_assignment_method == 'speakerchange':
+        elif self.heat_assignment_method == 'speaker-continuity':
             last_seg_end = [0 for _ in range(self.num_heat_channels)]
             last_seg_spkr = ['' for _ in range(self.num_heat_channels)]
             for sup in all_supervisions:
@@ -480,29 +379,26 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
                 speaker_id = sup.speaker
 
                 possible_channels = []
-                # for i in range(self.num_heat_channels):
                 for i in heat_channels:
                     if start >= last_seg_end[i]:
                         possible_channels.append(i)
 
                 if len(possible_channels) == 2:
                     if speaker_id in last_seg_spkr and last_seg_spkr.index(speaker_id) in possible_channels: # Pick based on speaker
-                        possible_channels = [last_seg_spkr.index(speaker_id)] # should be impossible for both channels to have the same last speaker
-                    elif last_seg_end.index(max(last_seg_end)) in possible_channels: # Pick based on last utterance end time
-                        # either channel works but neither is the same speaker so default to keepchannel
+                        possible_channels = [last_seg_spkr.index(speaker_id)] 
+                    elif last_seg_end.index(max(last_seg_end)) in possible_channels: # Pick based on recency-continuity
                         possible_channels = [last_seg_end.index(max(last_seg_end))]
                     
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 streams case; 3+ streams case might want to do something better
+                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end))
                 heat_assignments[assignment_channel].append(sup)
                 last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
                 if end >= last_seg_end[assignment_channel]:
                     last_seg_spkr[assignment_channel] = speaker_id 
-        else: # self.oracle_heat_assignment_method == 'standard'
+        else:
             last_seg_end = [0 for _ in range(self.num_heat_channels)]
             for sup in all_supervisions:
                 assigned = False
                 start, end = sup.start, sup.end_
-                # for i in range(self.num_heat_channels):
                 for i in heat_channels:
                     if start >= last_seg_end[i]:
                         heat_assignments[i].append(sup)
@@ -530,13 +426,12 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
                     else compute_num_samples(cut.duration, cut.sampling_rate)
                 )
 
-                heat_mask[heat_channel, st:et] = 1 # TODO: maybe set to +=1
+                heat_mask[heat_channel, st:et] = 1 
 
-        s_index = stream_id # just use stream_id later, this is only here to be consistent with original code
+        s_index = stream_id 
         heat_supervision = heat_assignments[s_index] # Pick supervising channel based on the stream_id
 
         target_spk = heat_mask[s_index] == 1
-        # target_spk = heat_mask[s_index] > 0
         sil_frames = heat_mask.sum(axis=0) == 0
 
         non_target_mask = np.ones(heat_mask.shape[0], dtype="bool")
@@ -546,58 +441,17 @@ class TS_ASR_HEAT_Dataset(TS_ASR_DatasetSuperclass, Dataset):
         non_target_speaker = different_spk * ~target_spk
         target_spk = target_spk * ~overlapping_speech
 
-        # reweighing the stno masks 
-        # silence stays the same 
-        # the rest are weighed by the number of speakers on that channel or both channel for overlap
-        if self.vad_mask_weights:
-            overlapping_speech = overlapping_speech * (heat_mask[s_index] + heat_mask[1 - s_index]) 
-            non_target_speaker = non_target_speaker * heat_mask[1 - s_index] #redundant, will not change anything
-            target_spk = target_spk * heat_mask[s_index] #redundant, will not change anything
-
         vad_mask = np.stack([sil_frames, target_spk, non_target_speaker, overlapping_speech], axis=0)
-
-        # old_transcript = [sup for supseg in heat_supervision for sup in supseg.alignment]
-
-        # transcription = ("" if self.use_timestamps else " ").join(
-        #     [self.get_segment_text_with_timestamps(segment, self.use_timestamps, self.text_norm) for segment in
-        #      heat_supervision])
 
         transcription = ("" if self.use_timestamps else " ").join(
             [self.get_segment_text_with_timestamps(segment, self.use_timestamps, self.text_norm) for segment in
              self.adjust_overlapping_transcription(heat_supervision)])
-
-        # transcription = ("" if self.use_timestamps else " ").join(
-        #     [self.get_segment_text_with_timestamps(segment, self.use_timestamps, self.text_norm) for segment in
-        #      reorder_transcripts(old_transcript, alpha=5, beta=0.5)])
 
         output = {"audio": audio.squeeze(axis=0), "vad_mask": vad_mask,
                   "do_augment": self.do_augment, 'heat_mask': heat_mask, 'heat_assignment': heat_assignments, 'all_supervisions': all_supervisions, "cut_id": cut.id,
                   "transcript": transcription}
         
         return output
-
-class TS_ASR_HEATJoiner_Dataset(TS_ASR_HEAT_Dataset):
-    def __init__(self,
-                 *args, 
-                 **kwargs):
-        TS_ASR_HEAT_Dataset.__init__(self, *args, **kwargs)
-
-    def __len__(self):
-        return self.to_index_mapping[-1] // 2
-    
-    def __getitem__(self, idx):
-        if idx > len(self):
-            raise 'Out of range'
-
-        idx = idx * 2
-
-        cut_index = np.searchsorted(self.to_index_mapping, idx, side='right')
-        cut = self.cset[cut_index]
-        # spks = self.get_cut_spks(cut) # sorted set, no global speaker tracking for heat
-        local_sid = (idx - self.to_index_mapping[cut_index]) % self.num_heat_channels
-        # sid = spks[local_sid] # no global speaker tracking for heat
-        return self.cut_to_sample(cut, local_sid)
-
 
 class TS_ASR_Random_Dataset(TS_ASR_DatasetSuperclass, IterableDataset):
     def __init__(self, *args, segment_len=30, random_sentence_l_crop_p=0.0, random_sentence_r_crop_p=0.0, max_l_crop=0,
@@ -968,12 +822,12 @@ class LhotseLongFormHeatDataset(Dataset):
                  text_norm: str = None, use_features: bool = False, feature_extractor: Callable = None,
                  audio_path_prefix=None, audio_path_prefix_replacement=None, references: CutSet = None,
                  soft_vad_temp=None, 
-                 num_heat_channels=2, oracle_heat_assignment_method='standard', diar_type='oracle', vad_mask_weights=False,
+                 num_heat_channels=2, heat_assignment_method='first-available', diar_type='oracle',
                  **kwargs):
         self.cutset = cutset
         self._references = references
         self.num_channels = num_heat_channels
-        self.oracle_heat_assignment_method = oracle_heat_assignment_method
+        self.heat_assignment_method = heat_assignment_method
         self.max_timestamp_pause = 0.0
 
         if (audio_path_prefix is not None and audio_path_prefix_replacement is not None):
@@ -996,9 +850,8 @@ class LhotseLongFormHeatDataset(Dataset):
         self.feature_extractor = feature_extractor
         self.single_stream_cuts = self.prepare_heat_cuts()
         self.soft_vad_temp = soft_vad_temp
-        self.oracle_heat_assignment_method = oracle_heat_assignment_method
+        self.heat_assignment_method = heat_assignment_method
         self.diar_type = diar_type
-        self.vad_mask_weights = vad_mask_weights
 
     def prepare_heat_cuts(self):
         single_stream_cuts = []
@@ -1016,7 +869,6 @@ class LhotseLongFormHeatDataset(Dataset):
 
     @property
     def cset(self) -> CutSet:
-        # TODO: Not needed if LhotseLongFormDataset inherits from TS_ASR_DatasetSuperclass
         return self.cutset
 
     @property
@@ -1092,36 +944,14 @@ class LhotseLongFormHeatDataset(Dataset):
         return new_merged_list
     
     def prepare_vad_mask(self, cut: Cut, stream_id: int):
-        
-        if self.diar_type == 'twostream':
-            streams = CutSet.from_cuts([cut]).speakers
-            
-            streams_to_idx = {spk: idx for idx, spk in enumerate(sorted(streams))}
-            vad_mask, heat_mask = self._prepare_vad_mask(cut, str(stream_id), streams_to_idx)
-            all_supervisions = []
-            for sid in self.get_cut_spks(cut): # all speakers in cut 
-                target_spk_cut = cut.filter_supervisions(lambda x: x.speaker == sid)
-                merged_supervisions = self.merge_supervisions(target_spk_cut)
-                all_supervisions = all_supervisions + merged_supervisions
-            return vad_mask, heat_mask, all_supervisions
-
-        if self.diar_type == 'hard': # Case of using actual trained heat vad mask 
-            all_supervisions = []
-            for sid in self.get_cut_spks(cut): # all speakers in cut 
-                target_spk_cut = cut.filter_supervisions(lambda x: x.speaker == sid)
-                merged_supervisions = self.merge_supervisions(target_spk_cut)
-                all_supervisions = all_supervisions + merged_supervisions
-            vad_mask, heat_mask = self._prepare_heat_vad_mask(cut, stream_id, all_supervisions, self.oracle_heat_assignment_method, self.vad_mask_weights)
-            return vad_mask, heat_mask, all_supervisions
-            # return self._prepare_soft_vad_mask(cut, stream_id, speakers_to_idx, temp=self.soft_vad_temp)
-        else: # Case of using oracle heat vad mask
-            all_supervisions = []
-            for sid in self.get_cut_spks(cut): # all speakers in cut 
-                target_spk_cut = cut.filter_supervisions(lambda x: x.speaker == sid)
-                merged_supervisions = self.merge_supervisions(target_spk_cut)
-                all_supervisions = all_supervisions + merged_supervisions 
-            vad_mask, heat_mask = self._prepare_heat_vad_mask(cut, stream_id, all_supervisions, self.oracle_heat_assignment_method, self.vad_mask_weights)
-            return vad_mask, heat_mask, all_supervisions
+        all_supervisions = []
+        for sid in self.get_cut_spks(cut): # all speakers in cut 
+            target_spk_cut = cut.filter_supervisions(lambda x: x.speaker == sid)
+            merged_supervisions = self.merge_supervisions(target_spk_cut)
+            all_supervisions = all_supervisions + merged_supervisions
+        vad_mask, heat_mask = self._prepare_heat_vad_mask(cut, stream_id, all_supervisions, self.heat_assignment_method)
+        return vad_mask, heat_mask, all_supervisions
+    
     @staticmethod
     def _prepare_vad_mask(cut, stream_id, streams_to_idx):
         s_index = streams_to_idx[stream_id]
@@ -1142,11 +972,68 @@ class LhotseLongFormHeatDataset(Dataset):
         return vad_mask, spk_mask
     
     @staticmethod
-    def _prepare_heat_vad_mask(cut, stream_id, all_supervisions, oracle_heat_assignment_method='standard', vad_mask_weights=False):
+    def _prepare_heat_vad_mask(cut, stream_id, all_supervisions, heat_assignment_method='first-available'):
         num_channels = 2
 
         heat_assignments = [[] for _ in range(num_channels)]
-        if oracle_heat_assignment_method == 'standard':
+        
+        if heat_assignment_method == 'alternating':
+            last_seg_end = [0 for _ in range(num_channels)]
+            last_channel_assigned = -1
+            for sup in all_supervisions:
+                start, end = sup.start, sup.end_
+
+                possible_channels = []
+                for i in range(num_channels):
+                    if start >= last_seg_end[i]:
+                        possible_channels.append(i)
+                if len(possible_channels) > 1 and last_channel_assigned in possible_channels:
+                    possible_channels.remove(last_channel_assigned) # Always alternate if possible
+                
+                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) 
+                heat_assignments[assignment_channel].append(sup)
+                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
+                last_channel_assigned = assignment_channel
+        elif heat_assignment_method == 'recency-continuity':
+            last_seg_end = [0 for _ in range(num_channels)]
+            for sup in all_supervisions:
+                start, end = sup.start, sup.end_
+
+                possible_channels = []
+                for i in range(num_channels):
+                    if start >= last_seg_end[i]:
+                        possible_channels.append(i)
+
+                if last_seg_end.index(max(last_seg_end)) in possible_channels:
+                    possible_channels = [last_seg_end.index(max(last_seg_end))] 
+
+                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) 
+                heat_assignments[assignment_channel].append(sup)
+                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
+        elif heat_assignment_method == 'speaker-continuity':
+            last_seg_end = [0 for _ in range(num_channels)]
+            last_seg_spkr = ['' for _ in range(num_channels)]
+            for sup in all_supervisions:
+                start, end = sup.start, sup.end_
+                speaker_id = sup.speaker
+
+                possible_channels = []
+                for i in range(num_channels):
+                    if start >= last_seg_end[i]:
+                        possible_channels.append(i)
+
+                if len(possible_channels) == 2:
+                    if speaker_id in last_seg_spkr and last_seg_spkr.index(speaker_id) in possible_channels: # Pick based on speaker
+                        possible_channels = [last_seg_spkr.index(speaker_id)] 
+                    elif last_seg_end.index(max(last_seg_end)) in possible_channels: # Pick based on recency-continuity
+                        possible_channels = [last_seg_end.index(max(last_seg_end))]
+                    
+                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end))
+                heat_assignments[assignment_channel].append(sup)
+                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
+                if end >= last_seg_end[assignment_channel]:
+                    last_seg_spkr[assignment_channel] = speaker_id 
+        else:
             last_seg_end = [0 for _ in range(num_channels)]
 
             for sup in all_supervisions:
@@ -1163,80 +1050,6 @@ class LhotseLongFormHeatDataset(Dataset):
                     heat_assignments[min_end_channel].append(sup)
                     last_seg_end[min_end_channel] = max(end, last_seg_end[min_end_channel])
 
-        elif oracle_heat_assignment_method == 'alternate':
-            last_seg_end = [0 for _ in range(num_channels)]
-            last_channel_assigned = -1
-            for sup in all_supervisions:
-                start, end = sup.start, sup.end_
-
-                possible_channels = []
-                for i in range(num_channels):
-                    if start >= last_seg_end[i]:
-                        possible_channels.append(i)
-                if len(possible_channels) > 1 and last_channel_assigned in possible_channels:
-                    possible_channels.remove(last_channel_assigned) # Always alternate if possible
-                
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 channel case; 3+ channel case might want to do something better
-                heat_assignments[assignment_channel].append(sup)
-                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
-                last_channel_assigned = assignment_channel
-        elif oracle_heat_assignment_method == 'keepchannel':
-            last_seg_end = [0 for _ in range(num_channels)]
-            last_channel_assigned = -1
-            for sup in all_supervisions:
-                start, end = sup.start, sup.end_
-
-                possible_channels = []
-                for i in range(num_channels):
-                    if start >= last_seg_end[i]:
-                        possible_channels.append(i)
-                if last_channel_assigned in possible_channels:
-                    possible_channels = [last_channel_assigned] # use last_channel_assigned if it won't contain overlaps
-
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 channel case; 3+ channel case might want to do something better
-                heat_assignments[assignment_channel].append(sup)
-                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
-                last_channel_assigned = assignment_channel
-        elif oracle_heat_assignment_method == 'keepchannel_maxlastsegend':
-            last_seg_end = [0 for _ in range(num_channels)]
-            for sup in all_supervisions:
-                start, end = sup.start, sup.end_
-
-                possible_channels = []
-                for i in range(num_channels):
-                    if start >= last_seg_end[i]:
-                        possible_channels.append(i)
-
-                if last_seg_end.index(max(last_seg_end)) in possible_channels:
-                    possible_channels = [last_seg_end.index(max(last_seg_end))] 
-
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 streams case; 3+ streams case might want to do something better
-                heat_assignments[assignment_channel].append(sup)
-                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
-        elif oracle_heat_assignment_method == 'speakerchange':
-            last_seg_end = [0 for _ in range(num_channels)]
-            last_seg_spkr = ['' for _ in range(num_channels)]
-            for sup in all_supervisions:
-                start, end = sup.start, sup.end_
-                speaker_id = sup.speaker
-
-                possible_channels = []
-                for i in range(num_channels):
-                    if start >= last_seg_end[i]:
-                        possible_channels.append(i)
-
-                if len(possible_channels) == 2:
-                    if speaker_id in last_seg_spkr and last_seg_spkr.index(speaker_id) in possible_channels: # Pick based on speaker
-                        possible_channels = [last_seg_spkr.index(speaker_id)] # should be impossible for both channels to have the same last speaker
-                    elif last_seg_end.index(max(last_seg_end)) in possible_channels: # Pick based on last utterance end time
-                        # either channel works but neither is the same speaker so default to keepchannel
-                        possible_channels = [last_seg_end.index(max(last_seg_end))]
-                    
-                assignment_channel = possible_channels[0] if len(possible_channels) > 0 else last_seg_end.index(min(last_seg_end)) # Indexing possible_channels[0] only for 2 streams case; 3+ streams case might want to do something better
-                heat_assignments[assignment_channel].append(sup)
-                last_seg_end[assignment_channel] = max(end, last_seg_end[assignment_channel])
-                if end >= last_seg_end[assignment_channel]:
-                    last_seg_spkr[assignment_channel] = speaker_id 
         heat_mask = np.zeros((num_channels, cut.num_samples))
         for heat_channel, heat_assignment in enumerate(heat_assignments):
             for supervision in heat_assignment:
@@ -1266,85 +1079,8 @@ class LhotseLongFormHeatDataset(Dataset):
         non_target_speaker = different_spk * ~target_spk
         target_spk = target_spk * ~overlapping_speech
 
-        if vad_mask_weights:
-            overlapping_speech = overlapping_speech * (heat_mask[s_index] + heat_mask[1 - s_index])
-            non_target_speaker = non_target_speaker * heat_mask[1 - s_index]
-            target_spk = target_spk * heat_mask[s_index]
-
-
         vad_mask = np.stack([sil_frames, target_spk, non_target_speaker, overlapping_speech], axis=0)
         return vad_mask, heat_mask
-    
-
-    # @staticmethod
-    # def _prepare_hard_heat_vad_mask(cut, stream_id, all_supervisions, oracle_heat_assignment_method='standard'):
-    #     # Time x Speakers
-    #     soft_labels = np.load(cut.soft_activations) # custom field
-    #     soft_labels = soft_labels / cut.norm_constant
-
-    #     hop = cut.shift_samples # custom field (e.g. 320 for 20ms and 16k Hz sampling freq.)
-    #     # Speakers x Time
-    #     soft_reshaped = soft_labels.T[..., None].repeat(hop, axis=-1).reshape((soft_labels.shape[1], -1))
-    #     pad_by = int(cut.duration * cut.sampling_rate) - soft_reshaped.shape[1]
-    #     if np.absolute(pad_by) > cut.sampling_rate * 10:
-    #         raise ValueError(f"Soft activations are too long/short for cut with id {cut.id}({cut.soft_activations})")
-
-    #     if pad_by >= 0:
-    #         soft_padded = np.pad(soft_reshaped, ((0, 0), (0, pad_by)))
-    #     else:
-    #         soft_padded = soft_reshaped[:, :pad_by]
-
-    #     spk_mask = soft_padded
-
-    #     s_index = speakers_to_idx[speaker_id]
-    #     non_target_mask = np.ones(spk_mask.shape[0], dtype="bool")
-    #     non_target_mask[s_index] = False
-    #     sil_frames = (1 - spk_mask).prod(axis=0)
-    #     noone_else = (1 - spk_mask[non_target_mask]).prod(axis=0)
-    #     target_spk = spk_mask[s_index] * noone_else
-    #     non_target_spk = (1 - spk_mask[s_index]) * (1 - noone_else)
-    #     overlapping_speech = spk_mask[s_index] - target_spk
-    #     vad_mask = np.stack([sil_frames, target_spk, non_target_spk, overlapping_speech], axis=0)
-
-    #     if temp is not None:
-    #         vad_mask = softmax(torch.tensor(vad_mask) / temp, dim=0).numpy() # Terrible hack
-
-    #     return vad_mask
-
-    # @staticmethod
-    # def _prepare_soft_vad_mask(cut: Cut, speaker_id: str, speakers_to_idx=None, temp=None):
-    #     # Time x Speakers
-    #     soft_labels = np.load(cut.soft_activations) # custom field
-    #     soft_labels = soft_labels / cut.norm_constant
-
-    #     hop = cut.shift_samples # custom field (e.g. 320 for 20ms and 16k Hz sampling freq.)
-    #     # Speakers x Time
-    #     soft_reshaped = soft_labels.T[..., None].repeat(hop, axis=-1).reshape((soft_labels.shape[1], -1))
-    #     pad_by = int(cut.duration * cut.sampling_rate) - soft_reshaped.shape[1]
-    #     if np.absolute(pad_by) > cut.sampling_rate * 10:
-    #         raise ValueError(f"Soft activations are too long/short for cut with id {cut.id}({cut.soft_activations})")
-
-    #     if pad_by >= 0:
-    #         soft_padded = np.pad(soft_reshaped, ((0, 0), (0, pad_by)))
-    #     else:
-    #         soft_padded = soft_reshaped[:, :pad_by]
-
-    #     spk_mask = soft_padded
-
-    #     s_index = speakers_to_idx[speaker_id]
-    #     non_target_mask = np.ones(spk_mask.shape[0], dtype="bool")
-    #     non_target_mask[s_index] = False
-    #     sil_frames = (1 - spk_mask).prod(axis=0)
-    #     noone_else = (1 - spk_mask[non_target_mask]).prod(axis=0)
-    #     target_spk = spk_mask[s_index] * noone_else
-    #     non_target_spk = (1 - spk_mask[s_index]) * (1 - noone_else)
-    #     overlapping_speech = spk_mask[s_index] - target_spk
-    #     vad_mask = np.stack([sil_frames, target_spk, non_target_spk, overlapping_speech], axis=0)
-
-    #     if temp is not None:
-    #         vad_mask = softmax(torch.tensor(vad_mask) / temp, dim=0).numpy() # Terrible hack
-
-    #     return vad_mask
 
 def get_libri_dataset(txt_norm, train_path=None, dev_path=None):
     from datasets import load_dataset, concatenate_datasets, load_from_disk
@@ -1373,7 +1109,6 @@ def get_nsf_dataset(text_norm, data_args):
                                    musan_noises=data_args.musan_noises,
                                    text_norm=text_norm,
                                    empty_transcript_ratio=data_args.empty_transcripts_ratio,
-                                   train_with_hard_diar_outputs=data_args.train_with_hard_diar_outputs,
                                    audio_path_prefix=data_args.audio_path_prefix,
                                    audio_path_prefix_replacement=data_args.audio_path_prefix_replacement,
                                    vad_from_alignments=data_args.vad_from_alignments,
@@ -1398,6 +1133,7 @@ def build_dataset(cutset_paths: List[Union[str, Path]], data_args: DataArguments
         logger.info('Using LhotseLongFormHeatDataset')
     else:
         logger.info('Using LhotseLongFormDataset')
+
     if cutset_paths is None or len(cutset_paths) == 0:
         raise ValueError("'cutset_paths' is None or empty. Please provide valid 'cutset_paths' for the dataset")
     if not all(Path(p).exists() for p in cutset_paths):
@@ -1406,9 +1142,9 @@ def build_dataset(cutset_paths: List[Union[str, Path]], data_args: DataArguments
 
     cutset = reduce(lambda a, b: a + b, [CutSet.from_file(path) for path in cutset_paths])
 
-    if data_args.diar_type != 'oracle':
-        if diar_cutset_paths is None or len(diar_cutset_paths) == 0:
-            raise ValueError("'diar_cutset_paths' is None or empty. Please provide valid 'diar_cutset_paths' for the dataset")
+    if data_args.diar_type != 'oracle' and diar_cutset_paths is not None:
+        if len(diar_cutset_paths) == 0:
+            raise ValueError("'diar_cutset_paths' is not None and empty. Please provide valid 'diar_cutset_paths' for the dataset")
         if not all(Path(p).exists() for p in diar_cutset_paths):
             wrong_paths = os.linesep.join([f"{'✗' if not Path(p).exists() else '✓'} {p}" for p in diar_cutset_paths])
             raise ValueError(f"Some diar cutset paths do not exist:{os.linesep}{wrong_paths}")
@@ -1425,7 +1161,7 @@ def build_dataset(cutset_paths: List[Union[str, Path]], data_args: DataArguments
                                     text_norm=text_norm, use_features=data_args.cache_features_for_dev,
                                     feature_extractor=container.feature_extractor,
                                     soft_vad_temp=dec_args.soft_vad_temp, 
-                                    num_heat_channels=data_args.num_heat_channels, oracle_heat_assignment_method=data_args.oracle_heat_assignment_method,
+                                    num_heat_channels=data_args.num_heat_channels, heat_assignment_method=data_args.heat_assignment_method,
                                     diar_type=data_args.diar_type,
                                     )
     else:

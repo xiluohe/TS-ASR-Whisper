@@ -7,7 +7,7 @@ from transformers import EarlyStoppingCallback
 from transformers.utils import logging
 from torch.utils.data import Dataset
 
-from data.local_datasets import build_dataset, TS_ASR_Dataset, TS_ASR_Random_Dataset, DataCollator, get_text_norm, TS_ASR_HEAT_Dataset, TS_ASR_HEATJoiner_Dataset
+from data.local_datasets import build_dataset, TS_ASR_Dataset, TS_ASR_Random_Dataset, DataCollator, get_text_norm, TS_ASR_HEAT_Dataset
 from models.containers import WhisperQKContainer, WhisperContainer, get_optimizer
 from mt_asr.dataset import MT_ASR_Dataset, MT_Data_Collator
 from utils.evaluation import compute_longform_metrics
@@ -30,21 +30,17 @@ def main(cfg: Cfg) -> None:
     text_norm = get_text_norm(data_args.eval_text_norm)
 
     if data_args.use_random_segmentation and data_args.use_heat_diar:
-        logger.info("Cannot have both use_random_segmentation and use_heat_diar right now.")
+        logger.info("Cannot have both use_random_segmentation and use_heat_diar.")
         train_dataset_class = None
     if data_args.use_random_segmentation:
         logger.info("Using TS_ASR_Random_Dataset")
         train_dataset_class = TS_ASR_Random_Dataset
-    elif data_args.use_heat_diar and not model_args.use_channel_joiner:
+    elif data_args.use_heat_diar:
         logger.info("Using TS_ASR_HEAT_Dataset")
         train_dataset_class = TS_ASR_HEAT_Dataset
-    elif data_args.use_heat_diar and model_args.use_channel_joiner:
-        logger.info("Using TS_ASR_HEATJoiner_Dataset")
-        train_dataset_class = TS_ASR_HEATJoiner_Dataset
     else:
         logger.info("Using TS_ASR_Dataset")
         train_dataset_class = TS_ASR_Dataset
-    # train_dataset_class = TS_ASR_Random_Dataset if data_args.use_random_segmentation else TS_ASR_Dataset
 
     if data_args.use_heat_diar:
         train_dataset = train_dataset_class(train_cutsets, do_augment=data_args.do_augment,
@@ -53,7 +49,6 @@ def main(cfg: Cfg) -> None:
                                             musan_noises=data_args.musan_noises,
                                             text_norm=get_text_norm(data_args.train_text_norm),
                                             empty_transcript_ratio=data_args.empty_transcripts_ratio,
-                                            train_with_hard_diar_outputs=data_args.train_with_hard_diar_outputs,
                                             audio_path_prefix=data_args.audio_path_prefix,
                                             audio_path_prefix_replacement=data_args.audio_path_prefix_replacement,
                                             vad_from_alignments=data_args.vad_from_alignments,
@@ -62,7 +57,7 @@ def main(cfg: Cfg) -> None:
                                             max_l_crop=data_args.max_l_crop,
                                             max_r_crop=data_args.max_r_crop,
                                             num_heat_channels=data_args.num_heat_channels,
-                                            oracle_heat_assignment_method=data_args.oracle_heat_assignment_method,
+                                            heat_assignment_method=data_args.heat_assignment_method,
                                             )
     else:
         train_dataset = train_dataset_class(train_cutsets, do_augment=data_args.do_augment,
@@ -71,7 +66,6 @@ def main(cfg: Cfg) -> None:
                                             musan_noises=data_args.musan_noises,
                                             text_norm=get_text_norm(data_args.train_text_norm),
                                             empty_transcript_ratio=data_args.empty_transcripts_ratio,
-                                            train_with_hard_diar_outputs=data_args.train_with_hard_diar_outputs,
                                             audio_path_prefix=data_args.audio_path_prefix,
                                             audio_path_prefix_replacement=data_args.audio_path_prefix_replacement,
                                             vad_from_alignments=data_args.vad_from_alignments,
@@ -97,7 +91,6 @@ def main(cfg: Cfg) -> None:
                               use_target_amplifiers=training_args.use_target_amplifiers,
                               target_amp_init=model_args.target_amp_init,
                               mt_num_speakers=model_args.mt_num_speakers if model_args.mt_asr else 1,
-                              use_channel_joiner=model_args.use_channel_joiner,
                               )
 
     # Create mapping between lower case and upper case tokens
@@ -149,14 +142,14 @@ def main(cfg: Cfg) -> None:
                             eval_dataset=dev_dataset,
                             data_collator=collator,
                             train_dataset=train_dataset, tokenizer=container.tokenizer, container=container,
-                            optimizers=(get_optimizer(model, training_args, model_args.prefixes_to_preheat, model_args.joiner_prefixes), None),
+                            optimizers=(get_optimizer(model, training_args, model_args.prefixes_to_preheat), None),
                             callbacks=[EarlyStoppingCallback(
                                 training_args.early_stopping_patience)] if training_args.early_stopping_patience > 0 else None,
                             params_to_keep_frozen=model_args.params_to_keep_frozen_keywords,
                             )
 
     if training_args.use_amplifiers_only_n_epochs > 0 or training_args.use_amplifiers_only_n_steps > 0:
-        container.model.freeze_except(model_args.prefixes_to_preheat+model_args.joiner_prefixes)
+        container.model.freeze_except(model_args.prefixes_to_preheat)
 
     if not model_args.reinit_from:
         container.model.suppress_interactions()
@@ -174,7 +167,7 @@ def main(cfg: Cfg) -> None:
                                             dset)
 
         trainer.compute_metrics = (lambda x: _compute_metrics(x, dev_dataset))
-    # training_args.save_before_eval = True
+
     # 7. Train the model
     if not training_args.decode_only:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
@@ -188,76 +181,8 @@ def main(cfg: Cfg) -> None:
     if decoding_args.decoding_ctc_weight is not None:
         model.generation_config.ctc_weight = decoding_args.decoding_ctc_weight
     
-    # Regular 
     outputs = trainer.predict(test_dataset=eval_dataset)
     metrics = outputs.metrics
     logger.info(f"Metrics {metrics}")
     if wandb.run is not None:
         wandb.log({f"test/{key}": val for key, val in metrics.items()})
-
-
-    # Batch by recording
-    # recording_to_indicies = {}
-    # for i, example in enumerate(eval_dataset):
-    #     recording_id, speaker_id = example['transcript'].split(',')
-    #     if recording_id in recording_to_indicies:
-    #         recording_to_indicies[recording_id].append(i)
-    #     else:
-    #         recording_to_indicies[recording_id] = [i]
-
-    # class SingleExampleDataset(Dataset):
-    #     def __init__(self, example):
-    #         self.example = example
-
-    #     def __len__(self):
-    #         return len(self.example)
-
-    #     def __getitem__(self, idx):
-    #         return self.example[idx]
-    
-    # res = {}
-
-    # for rec_id, spk_indices in recording_to_indicies.items():
-
-    #     # print(example['transcript'])
-    #     print(rec_id)
-
-    #     single_dataset = SingleExampleDataset([eval_dataset[i] for i in spk_indices])
-    #     outputs = trainer.predict(test_dataset=single_dataset)
-    #     metrics = outputs.metrics
-
-    #     res[rec_id] = metrics['test_runtime']
-    
-    #     logger.info(f"Metrics {metrics}")
-    #     if wandb.run is not None:
-    #         wandb.log({f"test/{key}": val for key, val in metrics.items()})
-    # print(res)
-
-
-    # Single
-    # res = {}
-
-    # class SingleExampleDataset(Dataset):
-    #     def __init__(self, example):
-    #         self.example = example
-
-    #     def __len__(self):
-    #         return 1
-
-    #     def __getitem__(self, idx):
-    #         return self.example
-
-    # for example in eval_dataset:
-
-    #     print(example['transcript'])
-
-    #     single_dataset = SingleExampleDataset(example)
-    #     outputs = trainer.predict(test_dataset=single_dataset)
-    #     metrics = outputs.metrics
-
-    #     res[example['transcript']] = metrics['test_runtime']
-    
-    #     logger.info(f"Metrics {metrics}")
-    #     if wandb.run is not None:
-    #         wandb.log({f"test/{key}": val for key, val in metrics.items()})
-    # print(res)

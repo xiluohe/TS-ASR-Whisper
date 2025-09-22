@@ -5,19 +5,9 @@ This repository contains the official implementation of the following publicatio
 - Target Speaker Whisper (available on [arxiv](https://arxiv.org/pdf/2409.09543))
 - DiCoW: Diarization-Conditioned Whisper for Target Speaker Automatic Speech Recognition (available on [arxiv](https://arxiv.org/pdf/2501.00114))
 
-## Interactive Demo
-We built a gradio app demo to make playing around with our model easy for you. To start, follow the steps below:
-1. Execute the first 3 steps of the setup below (next section).
-2. Run `cd inference_pipeline`
-3. Run `pip install -r requirements.txt`.
-4. Run `python app.py`
-5. Look for `* Running on public URL: {URL}`, copy&paste the `{URL}` to your browser and either use your microphone to record an audio sample or pass an audio recording.
-6. Hit `Submit` button and enjoy!
-
 ## Checkpoints
 We've released 2 checkpoints:
 1. A pre-trained CTC Whisper large-v3-turbo: [Download Link](https://nextcloud.fit.vutbr.cz/s/2AHfK2Gj2Jfa6EP)
-2. A pre-trained DiCoW (i.e. 1. + finetuning on AMI, NOTSOFAR, Libri2Mix): [HuggingFace](https://huggingface.co/BUT-FIT/DiCoW_v2)
 
 ## Training Setup
 1. Clone the repository: `git clone ...; cd ...`
@@ -41,24 +31,18 @@ Currently, our codebase offers 3 run modes:
 2. **fine-tune**: Fine-tune the whole Whisper with target speaker amplifiers to perform target speaker ASR
 3. **decode**: Decode with pre-trained model
 
-The codebase supports 3 compute grid systems: SGE, PBS, SLURM. Besides, one can also run training/decoding without any grid submission system by omitting the submission command (i.e. sbatch in the case of SLURM).
-
 To run the codebase, execute one of the following lines:
 ```bash
 # pre-train
 sbatch ./scripts/training/submit_slurm.sh +pretrain=ctc_librispeech_large
 
 # Fine-tune
-sbatch ./scripts/training/submit_slurm.sh +train=icassp/table1_final-models/ami
+sbatch ./scripts/training/submit_slurm.sh +train=icassp/heat_conditioning/ami_heat-speaker-continuity
 
 # Decode
-sbatch ./scripts/training/submit_slurm.sh +decode=best_ami
+sbatch ./scripts/training/submit_slurm.sh +decode=ami/best_ami_heat
 ```
 
-As SGE and PBS do not support variable-passing through shell arguments, you need to specify the config through variable list as:
-```
-qsub -v "CFG=+decode=best_ami" ./scripts/training/submit_sge.sh
-```
 
 ### Config Details
 As you can see above, the configs are not specified via yaml file paths. Instead, Hydra uses so-called "config groups". All of our config files contain `# @package _global_` on the first line, which specifies that the given values are overwriting the global default values specified in `./configs/base.yaml`. If the line is not present in the config yaml file, Hydra will produce a nested object based on the relative file path.
@@ -170,7 +154,7 @@ Parameters are described in `configs/local_paths.sh`. Edit the values accordingl
 | **training.use_target_amplifiers**            | bool                  | `true`                                                                                                  | Whether to use target amplifiers in the model.                                                        |
 | **training.warmup_steps**                     | int                   | `2000`                                                                                                  | Number of warm-up steps for learning rate scheduler.                                                  |
 | **training.weight_decay**                     | float                 | `0.0`                                                                                                   | Weight decay (L2 regularization) coefficient.                                                         |
-| **wandb.project**                             | string                | `"chime2024_ts_asr_whisper"`                                                                            | Name of the Weights & Biases project for logging.                                                     |
+| **wandb.project**                             | string                | `"ts_asr_whisper"`                                                                            | Name of the Weights & Biases project for logging.                                                     |
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

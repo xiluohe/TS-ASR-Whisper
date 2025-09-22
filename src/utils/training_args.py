@@ -92,16 +92,11 @@ class ModelArguments:
     prefixes_to_preheat: Optional[List[str]] = field(
         default=None, metadata={"help": "List of prefixes to preheat."}
     )
-    joiner_prefixes: Optional[List[str]] = field(
-        default=None, metadata={"help": "List of joiner prefixes."}
-    )
     mt_asr: Optional[bool] = field(default=False, metadata={"help": "Multi-talker ASR vs Target-speaker ASR (default)"})
     mt_num_speakers: Optional[int] = field(default=4, metadata={"help": "Number of speakers (channels) in MT-ASR"})
     params_to_keep_frozen_keywords: Optional[List[str]] = field(default=None, metadata={
         "help": "List of key words specifying layers to keep frozen."})
     
-    use_channel_joiner: Optional[bool] = field(default=False, metadata={"help": "Use additional joiner model to tie together heat channel outputs"})
-
     def __post_init__(self):
         if isinstance(self.reinit_encoder_from, str) and 'openai' in self.reinit_encoder_from:
             self.reinit_encoder_from = self.reinit_encoder_from.replace('openai/whisper-', '')
@@ -157,7 +152,6 @@ class DataArguments:
 
     # diarization
     train_with_diar_outputs: Optional[str] = field(default=None, metadata={"help": "Train with diar outputs."})
-    train_with_hard_diar_outputs: Optional[str] = field(default=None, metadata={"help": "Train with hard diar outputs."})
     use_diar: bool = field(default=False, metadata={
         "help": "Use diar outputs instead of ground-truth (affects e.g. long-form evaluation)."})
     diar_type: Optional[str] = field(default="oracle", metadata={
@@ -170,10 +164,8 @@ class DataArguments:
         "help": "Use HEAT-style diarization."})
     num_heat_channels: Optional[int] = field(default=2, metadata={
         "help": "Number of HEAT channels for HEAT-style diarization."})
-    oracle_heat_assignment_method: Optional[str] = field(default='standard', metadata={
+    heat_assignment_method: Optional[str] = field(default='standard', metadata={
         "help": "HEAT-style diarization channel assignment method."})
-    vad_mask_weights: Optional[bool] = field(default=False, metadata={
-        "help": "Weigh vad masks by diarization speaker count."})
 
     def __post_init__(self):
         if isinstance(self.train_cutsets, str):

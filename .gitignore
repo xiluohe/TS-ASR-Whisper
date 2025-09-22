@@ -181,5 +181,6 @@ data/libri*
 data/manifests
 data/nsf
 data
+!scripts/data
 
 pretrained_models

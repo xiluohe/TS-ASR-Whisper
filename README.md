@@ -47,7 +47,7 @@ Alternatively, to decode and score a trained model, run the example slurm script
 sbatch ./scripts/training/submit_slurm.sh +decode=ami/best_ami_heat
 ```
 
-## 3) Description of Different HEAT Heuristics
+## 4) Description of Different HEAT Heuristics
 
 This codebase creates activity conditioning masks generated from different HEAT heuristics, with performance varying greatly depending on the chosen heuristic. 
 
